@@ -1,38 +1,53 @@
-﻿using System.Text.Json;
-using System.Text.Json.Serialization;
-using TravelExpenses.Api.Services.Interfaces;
+﻿using TravelExpenses.Api.Services.Interfaces;
 
 namespace TravelExpenses.Api.Services.ExchangeRates;
 
 public class ExchangeRateService : IExchangeRateService
 {
-    private readonly HttpClient _httpClient;
-
-    // cache in memoria: "USD" -> 0.95m (significa 1 USD = 0.95 EUR)
-    private readonly Dictionary<string, decimal> _ratesToEur = new(StringComparer.OrdinalIgnoreCase);
-    private DateTime _lastUpdatedUtc = DateTime.MinValue;
-    private readonly object _lock = new();
-
-    // fallback statici (per valute non presenti o in caso di errore API)
-    private static readonly Dictionary<string, decimal> _fallbackRates = new(StringComparer.OrdinalIgnoreCase)
+    // Dizionario statico con i tassi di cambio predefiniti (1 Unità Estera = X Euro)
+    // I valori sono approssimazioni medie aggiornate per garantire coerenza nei calcoli
+    private static readonly Dictionary<string, decimal> _fixedRates = new(StringComparer.OrdinalIgnoreCase)
     {
-        { "EUR", 1.0m },
-        { "MAD", 0.093m }, 
-        { "USD", 0.95m },
-        { "GBP", 1.15m },
-        { "JPY", 0.006m }
+        // Europa & Americhe
+        { "EUR", 1.0m },      // Euro
+        { "USD", 0.95m },     // Dollaro Americano
+        { "GBP", 1.20m },     // Sterlina Britannica
+        { "CHF", 1.06m },     // Franco Svizzero
+        { "CAD", 0.68m },     // Dollaro Canadese
+        { "BRL", 0.17m },     // Real Brasiliano
+        { "MXN", 0.051m },    // Peso Messicano
+
+        // Africa & Medio Oriente
+        { "MAD", 0.093m },    // Dirham Marocchino
+        { "EGP", 0.020m },    // Sterlina Egiziana
+        { "AED", 0.26m },     // Dirham degli Emirati Arabi
+        { "ILS", 0.25m },     // Shekel Israeliano
+        { "ZAR", 0.052m },    // Rand Sudafricano
+        { "TRY", 0.030m },    // Lira Turca
+
+        // Asia & Oceania
+        { "JPY", 0.0062m },   // Yen Giapponese
+        { "CNY", 0.13m },     // Yuan Cinese
+        { "INR", 0.011m },    // Rupia Indiana
+        { "AUD", 0.62m },     // Dollaro Australiano
+        { "NZD", 0.58m },     // Dollaro Neozelandese
+        { "SGD", 0.70m },     // Dollaro di Singapore
+        { "HKD", 0.12m },     // Dollaro di Hong Kong
+        { "KRW", 0.0007m },   // Won Sudcoreano
+        { "THB", 0.027m },    // Baht Thailandese
+        { "IDR", 0.00006m },  // Rupia Indonesiana
+        { "VND", 0.000038m }  // Dong Vietnamita
     };
 
-    private static readonly JsonSerializerOptions _jsonOptions = new()
+    public ExchangeRateService()
     {
-        PropertyNameCaseInsensitive = true
-    };
-
-    public ExchangeRateService(HttpClient httpClient)
-    {
-        _httpClient = httpClient;
+        // Rimosso HttpClient perché non interpelliamo più API esterne
     }
 
+    /// <summary>
+    /// Restituisce il tasso di cambio fisso per convertire verso l'Euro.
+    /// Esempio: Se chiedi "USD", restituisce 0.95 (1 USD = 0.95 EUR).
+    /// </summary>
     public async Task<decimal?> GetRateToEurAsync(string currencyCode, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(currencyCode))
@@ -40,140 +55,13 @@ public class ExchangeRateService : IExchangeRateService
 
         currencyCode = currencyCode.ToUpperInvariant();
 
-        // 1) Se in cache aggiornata oggi → restituisci subito
-        lock (_lock)
+        // Cerchiamo direttamente nel dizionario delle valute definite
+        if (_fixedRates.TryGetValue(currencyCode, out var rate))
         {
-            if (_ratesToEur.TryGetValue(currencyCode, out var cached) &&
-                _lastUpdatedUtc.Date == DateTime.UtcNow.Date)
-            {
-                return cached;
-            }
+            return await Task.FromResult(rate);
         }
 
-        // 2) Prova ad aggiornare la cache da API esterna (una volta al giorno)
-        await EnsureRatesLoadedAsync(ct);
-
-        lock (_lock)
-        {
-            if (_ratesToEur.TryGetValue(currencyCode, out var rate))
-            {
-                return rate;
-            }
-        }
-
-        // 3) Fallback statico se non lo trovi neanche dopo l’update
-        if (_fallbackRates.TryGetValue(currencyCode, out var fallback))
-        {
-            return fallback;
-        }
-
-        // 4) Ultima spiaggia: nessun rate disponibile
-        return null;
-    }
-
-    private async Task EnsureRatesLoadedAsync(CancellationToken ct)
-    {
-        lock (_lock)
-        {
-            if (_lastUpdatedUtc.Date == DateTime.UtcNow.Date && _ratesToEur.Count > 0)
-                return; // già aggiornato oggi
-        }
-
-        Dictionary<string, decimal> newRates;
-
-        try
-        {
-            // chiamiamo /latest con base EUR (default di Frankfurter)
-            using var response = await _httpClient.GetAsync("latest", ct);
-            response.EnsureSuccessStatusCode();
-
-            await using var stream = await response.Content.ReadAsStreamAsync(ct);
-            var data = await JsonSerializer.DeserializeAsync<FrankfurterLatestResponse>(stream, _jsonOptions, ct);
-
-            if (data == null || data.Rates == null || data.Rates.Count == 0)
-                throw new Exception("Risposta Frankfurter vuota.");
-
-            newRates = new Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase);
-
-            // se base è EUR, i rates sono: 1 EUR = rate[CUR] CUR
-            if (string.Equals(data.Base, "EUR", StringComparison.OrdinalIgnoreCase))
-            {
-                newRates["EUR"] = 1m;
-
-                foreach (var kvp in data.Rates)
-                {
-                    var currency = kvp.Key;
-                    var eurToCur = kvp.Value;
-
-                    if (eurToCur <= 0)
-                        continue;
-
-                    // noi vogliamo: 1 CUR = X EUR  → X = 1 / eurToCur
-                    newRates[currency] = 1m / eurToCur;
-                }
-            }
-            else
-            {
-                // Caso teorico: base != EUR.
-                // Se c'è EUR tra i rates, possiamo ricavare tutti i ToEur.
-                if (!data.Rates.TryGetValue("EUR", out var baseToEur) || baseToEur <= 0)
-                    throw new Exception("EUR non presente nei rates di Frankfurter.");
-
-                // 1 BASE = baseToEur EUR → 1 BASE = baseToEur EUR
-                // quindi: 1 CUR = ? EUR
-                // data.Rates[cur] = 1 BASE = r CUR → 1 CUR = (baseToEur / r) EUR
-                newRates[data.Base] = baseToEur;
-
-                foreach (var kvp in data.Rates)
-                {
-                    var currency = kvp.Key;
-                    var baseToCur = kvp.Value;
-
-                    if (baseToCur <= 0)
-                        continue;
-
-                    // 1 CUR = (baseToEur / baseToCur) EUR
-                    newRates[currency] = baseToEur / baseToCur;
-                }
-            }
-
-            // integriamo anche i fallback mancanti (es. MAD) senza sovrascrivere i valori reali
-            foreach (var kvp in _fallbackRates)
-            {
-                if (!newRates.ContainsKey(kvp.Key))
-                {
-                    newRates[kvp.Key] = kvp.Value;
-                }
-            }
-        }
-        catch
-        {
-            // se l’API esterna fallisce, usiamo SOLO i fallback
-            newRates = new Dictionary<string, decimal>(_fallbackRates, StringComparer.OrdinalIgnoreCase);
-        }
-
-        lock (_lock)
-        {
-            _ratesToEur.Clear();
-            foreach (var kvp in newRates)
-            {
-                _ratesToEur[kvp.Key] = kvp.Value;
-            }
-
-            _lastUpdatedUtc = DateTime.UtcNow;
-        }
-    }
-
-    // DTO per deserializzare la risposta di Frankfurter
-    private sealed class FrankfurterLatestResponse
-    {
-        [JsonPropertyName("base")]
-        public string Base { get; set; } = default!;
-
-        [JsonPropertyName("date")]
-        public DateTime Date { get; set; }
-
-        [JsonPropertyName("rates")]
-        public Dictionary<string, decimal> Rates { get; set; } = new();
+        // Se la valuta non è in elenco, restituiamo null
+        return await Task.FromResult<decimal?>(null);
     }
 }

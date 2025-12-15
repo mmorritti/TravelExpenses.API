@@ -38,12 +38,7 @@ builder.Services.AddScoped<ICategoryService, CategoryService>();
 builder.Services.AddScoped<ITravelService, TravelService>();
 builder.Services.AddScoped<ITravelCurrencyRateService, TravelCurrencyRateService>();
 builder.Services.AddScoped<IExpanseService, ExpanseService>();
-builder.Services.AddHttpClient<IExchangeRateService, ExchangeRateService>(client =>
-{
-    client.BaseAddress = new Uri("https://api.frankfurter.dev/v1/");
-    client.Timeout = TimeSpan.FromSeconds(5);
-});
-
+builder.Services.AddSingleton<IExchangeRateService, ExchangeRateService>();
 
 // Controllers
 builder.Services.AddControllers();
