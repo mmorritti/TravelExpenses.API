@@ -1,10 +1,13 @@
-﻿using Microsoft.AspNetCore.Mvc;
+﻿using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using System.Security.Claims;
 using TravelExpenses.Api.Dtos;
 using TravelExpenses.Api.Services.Interfaces;
 using TravelExpenses.Domain.Entities;
 
 namespace TravelExpenses.Api.Controllers;
 
+[Authorize]
 [ApiController]
 [Route("api/travels/{travelId:guid}/rates")]
 public class TravelCurrencyRatesController : ControllerBase
@@ -20,13 +23,15 @@ public class TravelCurrencyRatesController : ControllerBase
         _travelService = travelService;
     }
 
+    private string GetUserId() => User.FindFirst(ClaimTypes.NameIdentifier)?.Value!;
+
     // GET: api/travels/{travelId}/rates
     [HttpGet]
     public async Task<ActionResult<IEnumerable<TravelCurrencyRateDto>>> GetRates(Guid travelId)
     {
         var travel = await _travelService.GetByIdAsync(travelId);
-        if (travel is null)
-            return NotFound($"Travel {travelId} non trovato");
+        if (travel is null) return NotFound("Travel non trovato");
+        if (travel.UserId != GetUserId()) return Forbid();
 
         var rates = await _rateService.GetByTravelIdAsync(travelId);
 
@@ -46,8 +51,13 @@ public class TravelCurrencyRatesController : ControllerBase
     public async Task<ActionResult<TravelCurrencyRateDto>> GetRate(Guid travelId, Guid rateId)
     {
         var rate = await _rateService.GetByIdAsync(rateId);
-        if (rate is null || rate.TravelId != travelId)
-            return NotFound();
+
+        // Verifica esistenza e appartenenza al viaggio
+        if (rate is null || rate.TravelId != travelId) return NotFound();
+
+        // Verifica che il viaggio sia dell'utente
+        var travel = await _travelService.GetByIdAsync(travelId);
+        if (travel == null || travel.UserId != GetUserId()) return Forbid();
 
         var dto = new TravelCurrencyRateDto
         {
@@ -67,8 +77,8 @@ public class TravelCurrencyRatesController : ControllerBase
         [FromBody] CreateTravelCurrencyRateRequest request)
     {
         var travel = await _travelService.GetByIdAsync(travelId);
-        if (travel is null)
-            return NotFound($"Travel {travelId} non trovato");
+        if (travel is null) return NotFound();
+        if (travel.UserId != GetUserId()) return Forbid();
 
         var rate = new TravelCurrencyRate
         {
@@ -104,8 +114,11 @@ public class TravelCurrencyRatesController : ControllerBase
         [FromBody] UpdateTravelCurrencyRateRequest request)
     {
         var existing = await _rateService.GetByIdAsync(rateId);
-        if (existing is null || existing.TravelId != travelId)
-            return NotFound();
+        if (existing is null || existing.TravelId != travelId) return NotFound();
+
+        // Controllo proprietario viaggio
+        var travel = await _travelService.GetByIdAsync(travelId);
+        if (travel == null || travel.UserId != GetUserId()) return Forbid();
 
         existing.CurrencyCode = request.CurrencyCode;
         existing.RateToBase = request.RateToBase;
@@ -121,8 +134,10 @@ public class TravelCurrencyRatesController : ControllerBase
     public async Task<IActionResult> DeleteRate(Guid travelId, Guid rateId)
     {
         var existing = await _rateService.GetByIdAsync(rateId);
-        if (existing is null || existing.TravelId != travelId)
-            return NotFound();
+        if (existing is null || existing.TravelId != travelId) return NotFound();
+
+        var travel = await _travelService.GetByIdAsync(travelId);
+        if (travel == null || travel.UserId != GetUserId()) return Forbid();
 
         await _rateService.DeleteAsync(rateId);
 

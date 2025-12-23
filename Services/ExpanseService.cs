@@ -19,4 +19,10 @@ public class ExpanseService : BaseService<Expense>, IExpanseService
         var all = await _repository.GetAllAsync();
         return all.Where(e => e.TravelId == travelId);
     }
+
+    public async Task<IEnumerable<Expense>> GetAllAsync(string userId)
+    {
+        var all = await _repository.GetAllAsync();
+        return all.Where(e => e.UserId == userId);
+    }
 }

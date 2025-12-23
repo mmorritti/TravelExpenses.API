@@ -1,4 +1,6 @@
-﻿using Microsoft.AspNetCore.Mvc;
+﻿using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using System.Security.Claims;
 using TravelExpenses.Api.Dtos;
 using TravelExpenses.Api.Services.ExchangeRates;
 using TravelExpenses.Api.Services.Interfaces;
@@ -6,6 +8,7 @@ using TravelExpenses.Domain.Entities;
 
 namespace TravelExpenses.Api.Controllers;
 
+[Authorize]
 [ApiController]
 [Route("api/[controller]")]
 public class TravelsController : ControllerBase
@@ -30,11 +33,14 @@ public class TravelsController : ControllerBase
         _exchangeRateService = exchangeRateService;
     }
 
+    private string GetUserId() => User.FindFirst(ClaimTypes.NameIdentifier)?.Value!;
+
     // GET: api/travels
     [HttpGet]
     public async Task<ActionResult<IEnumerable<TravelDto>>> GetAll()
     {
-        var travels = await _travelService.GetAllAsync();
+        // Passiamo l'ID per filtrare solo i viaggi dell'utente
+        var travels = await _travelService.GetAllAsync(GetUserId());
 
         var result = travels
             .Select(t => new TravelDto
@@ -57,8 +63,9 @@ public class TravelsController : ControllerBase
     public async Task<ActionResult<TravelDto>> GetById(Guid id)
     {
         var travel = await _travelService.GetByIdAsync(id);
-        if (travel is null)
-            return NotFound();
+
+        if (travel is null) return NotFound();
+        if (travel.UserId != GetUserId()) return NotFound(); // Protezione
 
         var dto = new TravelDto
         {
@@ -79,8 +86,8 @@ public class TravelsController : ControllerBase
     public async Task<ActionResult<TravelSummaryDto>> GetSummary(Guid id)
     {
         var travel = await _travelService.GetByIdAsync(id);
-        if (travel is null)
-            return NotFound();
+        if (travel is null) return NotFound();
+        if (travel.UserId != GetUserId()) return Forbid();
 
         var summary = await BuildTravelSummaryAsync(travel);
         return Ok(summary);
@@ -90,7 +97,8 @@ public class TravelsController : ControllerBase
     [HttpGet("summaries")]
     public async Task<ActionResult<IEnumerable<TravelSummaryDto>>> GetAllSummaries()
     {
-        var travels = await _travelService.GetAllAsync();
+        // Anche qui filtriamo per utente
+        var travels = await _travelService.GetAllAsync(GetUserId());
 
         var list = new List<TravelSummaryDto>();
         foreach (var travel in travels)
@@ -107,8 +115,9 @@ public class TravelsController : ControllerBase
     [HttpPost]
     public async Task<ActionResult<TravelDto>> Create([FromBody] CreateTravelRequest request)
     {
-        if (!ModelState.IsValid)
-            return BadRequest(ModelState);
+        if (!ModelState.IsValid) return BadRequest(ModelState);
+
+        var userId = GetUserId();
 
         var travel = new Travel
         {
@@ -119,6 +128,7 @@ public class TravelsController : ControllerBase
             TravelCurrencyCode = request.TravelCurrencyCode,
             StartDate = request.StartDate,
             EndDate = request.EndDate,
+            UserId = userId, // <--- Assegnazione ID
             CreatedAt = DateTime.UtcNow,
             UpdatedAt = DateTime.UtcNow
         };
@@ -136,7 +146,7 @@ public class TravelsController : ControllerBase
             EndDate = travel.EndDate
         };
 
-        // crea automaticamente il rate di cambio usando il servizio esterno
+        // Automazione cambio valuta
         var rateToBase = await _exchangeRateService.GetRateToEurAsync(travel.TravelCurrencyCode);
 
         if (rateToBase.HasValue)
@@ -150,7 +160,6 @@ public class TravelsController : ControllerBase
                 CreatedAt = DateTime.UtcNow,
                 UpdatedAt = DateTime.UtcNow
             };
-
             await _travelCurrencyRateService.CreateAsync(rate);
         }
 
@@ -162,8 +171,8 @@ public class TravelsController : ControllerBase
     public async Task<IActionResult> Update(Guid id, [FromBody] UpdateTravelRequest request)
     {
         var existing = await _travelService.GetByIdAsync(id);
-        if (existing is null)
-            return NotFound();
+        if (existing is null) return NotFound();
+        if (existing.UserId != GetUserId()) return Forbid();
 
         existing.Name = request.Name;
         existing.CountryCode = request.CountryCode;
@@ -183,8 +192,8 @@ public class TravelsController : ControllerBase
     public async Task<IActionResult> Delete(Guid id)
     {
         var existing = await _travelService.GetByIdAsync(id);
-        if (existing is null)
-            return NotFound();
+        if (existing is null) return NotFound();
+        if (existing.UserId != GetUserId()) return Forbid();
 
         await _travelService.DeleteAsync(id);
 
@@ -195,8 +204,9 @@ public class TravelsController : ControllerBase
 
     private async Task<TravelSummaryDto> BuildTravelSummaryAsync(Travel travel)
     {
+        // Nota: Assumiamo che GetByTravelId ritorni solo le spese di quel viaggio 
+        // (che è già verificato appartenere all'utente nel chiamante)
         var expanses = await _expanseService.GetByTravelIdAsync(travel.TravelId);
-
         var rates = await _travelCurrencyRateService.GetByTravelIdAsync(travel.TravelId);
         var ratesDict = rates.ToDictionary(r => r.CurrencyCode, r => r.RateToBase);
 
@@ -209,14 +219,15 @@ public class TravelsController : ControllerBase
         decimal totalHome = 0m;
         decimal totalTravel = 0m;
 
-        var allCategories = await _categoryService.GetAllAsync();
+        // Per la summary, ci servono i nomi delle categorie.
+        // Possiamo ottimizzare caricandole tutte (System + User)
+        var allCategories = await _categoryService.GetAllAsync(GetUserId());
         var catDict = allCategories.ToDictionary(c => c.CategoryId, c => c.Name);
 
         var categoryTotals = new Dictionary<Guid, (decimal travelTotal, decimal homeTotal)>();
 
         foreach (var e in expanses)
         {
-            // importo in valuta di casa
             decimal amountHome;
             if (e.CurrencyCode == travel.HomeCurrencyCode)
             {
@@ -231,7 +242,6 @@ public class TravelsController : ControllerBase
                 amountHome = e.Amount;
             }
 
-            // importo in valuta del viaggio
             decimal amountTravel;
             if (travelToHomeRate > 0)
             {

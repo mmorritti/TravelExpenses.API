@@ -1,10 +1,13 @@
-﻿using Microsoft.AspNetCore.Mvc;
+﻿using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using System.Security.Claims;
 using TravelExpenses.Api.Dtos;
 using TravelExpenses.Api.Services.Interfaces;
 using TravelExpenses.Domain.Entities;
 
 namespace TravelExpenses.Api.Controllers;
 
+[Authorize]
 [ApiController]
 [Route("api/[controller]")]
 public class ExpansesController : ControllerBase
@@ -23,23 +26,27 @@ public class ExpansesController : ControllerBase
         _categoryService = categoryService;
     }
 
+    private string GetUserId() => User.FindFirst(ClaimTypes.NameIdentifier)?.Value!;
+
     // GET: api/expanses?travelId=...
     [HttpGet]
     public async Task<ActionResult<IEnumerable<ExpanseDto>>> GetAll([FromQuery] Guid? travelId)
     {
         IEnumerable<Expense> expanses;
+        var userId = GetUserId();
 
         if (travelId.HasValue)
         {
             var travel = await _travelService.GetByIdAsync(travelId.Value);
-            if (travel is null)
-                return NotFound($"Travel {travelId} non trovato");
+            if (travel is null) return NotFound($"Travel {travelId} non trovato");
+            if (travel.UserId != userId) return Forbid(); // Sicurezza
 
             expanses = await _expanseService.GetByTravelIdAsync(travelId.Value);
         }
         else
         {
-            expanses = await _expanseService.GetAllAsync();
+            // Recupera TUTTE le spese dell'utente (di tutti i viaggi)
+            expanses = await _expanseService.GetAllAsync(userId);
         }
 
         var result = expanses.Select(e => new ExpanseDto
@@ -62,8 +69,8 @@ public class ExpansesController : ControllerBase
     public async Task<ActionResult<ExpanseDto>> GetById(Guid id)
     {
         var expanse = await _expanseService.GetByIdAsync(id);
-        if (expanse is null)
-            return NotFound();
+        if (expanse is null) return NotFound();
+        if (expanse.UserId != GetUserId()) return NotFound(); // Protezione
 
         var dto = new ExpanseDto
         {
@@ -84,17 +91,18 @@ public class ExpansesController : ControllerBase
     [HttpPost]
     public async Task<ActionResult<ExpanseDto>> Create([FromBody] CreateExpanseRequest request)
     {
-        if (!ModelState.IsValid)
-            return BadRequest(ModelState);
+        if (!ModelState.IsValid) return BadRequest(ModelState);
 
-        // verifica Travel e Category
+        var userId = GetUserId();
+
+        // Verifica Travel
         var travel = await _travelService.GetByIdAsync(request.TravelId);
-        if (travel is null)
-            return NotFound($"Travel {request.TravelId} non trovato");
+        if (travel is null) return NotFound("Viaggio non trovato");
+        if (travel.UserId != userId) return Forbid();
 
+        // Verifica Category
         var category = await _categoryService.GetByIdAsync(request.CategoryId);
-        if (category is null)
-            return NotFound($"Category {request.CategoryId} non trovata");
+        if (category is null) return NotFound("Categoria non trovata");
 
         var expanse = new Expense
         {
@@ -106,6 +114,7 @@ public class ExpansesController : ControllerBase
             Amount = request.Amount,
             CurrencyCode = request.CurrencyCode,
             Description = request.Description,
+            UserId = userId, // <--- Importante
             CreatedAt = DateTime.UtcNow,
             UpdatedAt = DateTime.UtcNow
         };
@@ -132,16 +141,15 @@ public class ExpansesController : ControllerBase
     public async Task<IActionResult> Update(Guid id, [FromBody] UpdateExpanseRequest request)
     {
         var existing = await _expanseService.GetByIdAsync(id);
-        if (existing is null)
-            return NotFound();
+        if (existing is null) return NotFound();
+        if (existing.UserId != GetUserId()) return Forbid();
 
-        var travel = await _travelService.GetByIdAsync(request.TravelId);
-        if (travel is null)
-            return NotFound($"Travel {request.TravelId} non trovato");
-
-        var category = await _categoryService.GetByIdAsync(request.CategoryId);
-        if (category is null)
-            return NotFound($"Category {request.CategoryId} non trovata");
+        // Opzionale: verificare se stai spostando la spesa su un viaggio non tuo
+        if (existing.TravelId != request.TravelId)
+        {
+            var newTravel = await _travelService.GetByIdAsync(request.TravelId);
+            if (newTravel == null || newTravel.UserId != GetUserId()) return BadRequest("Viaggio non valido");
+        }
 
         existing.TravelId = request.TravelId;
         existing.CategoryId = request.CategoryId;
@@ -162,8 +170,8 @@ public class ExpansesController : ControllerBase
     public async Task<IActionResult> Delete(Guid id)
     {
         var existing = await _expanseService.GetByIdAsync(id);
-        if (existing is null)
-            return NotFound();
+        if (existing is null) return NotFound();
+        if (existing.UserId != GetUserId()) return Forbid();
 
         await _expanseService.DeleteAsync(id);
 
